@@ -1,4 +1,5 @@
 name: OpenWrt Builder (MF68E)
+
 on:
   repository_dispatch:
   workflow_dispatch:
@@ -21,7 +22,12 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /etc/apt/sources.list.d/* \
+          /usr/share/dotnet \
+          /usr/local/lib/android \
+          /opt/ghc \
+          /opt/hostedtoolcache/CodeQL
+
         sudo docker image prune --all --force
         sudo -E apt-get -qq update
         sudo -E ./devenv/dependencies.sh
@@ -31,35 +37,93 @@ jobs:
 
     - name: "Clone OpenWrt source code"
       run: |
-        df -hT $PWD
-        git clone --depth=1 --branch "main" https://git.openwrt.org/openwrt/openwrt.git openwrt
+        df -hT "$PWD"
+
+        git clone \
+          --depth=1 \
+          --branch "main" \
+          https://git.openwrt.org/openwrt/openwrt.git \
+          openwrt
+
+    - name: "Diagnose OpenWrt source"
+      run: |
+        echo "========================================"
+        echo "        OPENWRT COMMIT"
+        echo "========================================"
+
+        cd openwrt
+
+        git log -1 --oneline
+        git remote -v
+
+        echo
+        echo "========================================"
+        echo "        OPENWRT STATUS"
+        echo "========================================"
+
+        git status --short
+
+        echo
+        echo "========================================"
+        echo "        ATH.MK LOCATION"
+        echo "========================================"
+
+        ls -lh package/kernel/mac80211/ath.mk
+
+        echo
+        echo "========================================"
+        echo "        ATH.MK - LINES 1-430"
+        echo "========================================"
+
+        nl -ba package/kernel/mac80211/ath.mk | sed -n '1,430p'
+
+        echo
+        echo "========================================"
+        echo "        ATH10K REFERENCES
+        ========================================"
+
+        grep -n -E \
+          'ath10k|ath11k|ath12k|wcn36xx|sdio' \
+          package/kernel/mac80211/ath.mk || true
+
+        cd ..
 
     - name: Load msm89xx target and packages
       run: |
+        echo "========================================"
+        echo "        APPLYING WCN36XX PATCH"
+        echo "========================================"
+
+        git apply --check --unsafe-paths enable_wcn36xx_mac80211.patch
+
         git apply --unsafe-paths enable_wcn36xx_mac80211.patch
+
         mv msm89xx openwrt/target/linux/msm89xx
         mv packages openwrt/package/uz801
-        if [ "${{ inputs.openwrt_version }}" == "openwrt-24.10" ]; then
-          sed -i '/^KERNEL_PATCHVER/c\KERNEL_PATCHVER:=6.6' openwrt/target/linux/msm89xx/Makefile
-        fi
 
     - name: Update and install feeds
       run: |
         cd openwrt
+
         rm -rf tmp
+
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
     - name: "Load diffconfig"
       run: |
-        [ -f diffconfig_mf68e ] && mv diffconfig_mf68e openwrt/.config
+        if [ -f diffconfig_mf68e ]; then
+          mv diffconfig_mf68e openwrt/.config
+        fi
 
     - name: Download package
       id: package
       run: |
         cd openwrt
+
         make defconfig
         make download -j8
+
         find dl -size -1024c -exec ls -l {} \; || true
         find dl -size -1024c -exec rm -f {} \; || true
 
@@ -67,21 +131,33 @@ jobs:
       id: compile
       run: |
         cd openwrt
+
         echo -e "$(nproc) thread compile"
+
         make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config \
+          | sed -r 's/.*DEVICE_(.*)=y/\1/' \
+          > DEVICE_NAME
+
+        if [ -s DEVICE_NAME ]; then
+          echo "DEVICE_NAME=$(cat DEVICE_NAME)" >> "$GITHUB_ENV"
+        fi
+
+        echo "FILE_DATE=$(date +"%Y%m%d%H%M")" >> "$GITHUB_ENV"
 
     - name: Organize files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
         cd openwrt/bin/targets/*/*
+
         rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
+
+        echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+        echo "status=success" >> "$GITHUB_OUTPUT"
 
     - name: Upload firmware
       uses: actions/upload-artifact@v4
