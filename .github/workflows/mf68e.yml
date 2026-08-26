@@ -15,13 +15,383 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+
+    # ============================================================
+    # CHECKOUT DO NOSSO REPOSITÓRIO
+    # ============================================================
     - name: Checkout
       uses: actions/checkout@v4
 
+
+    # ============================================================
+    # CLONAR OPENWRT
+    # ============================================================
+    - name: Clone OpenWrt source code
+      run: |
+        echo "========================================"
+        echo "        CLONING OPENWRT"
+        echo "========================================"
+
+        git clone --depth=1 \
+          --branch main \
+          https://git.openwrt.org/openwrt/openwrt.git \
+          openwrt
+
+        cd openwrt
+
+        echo
+        echo "OPENWRT COMMIT:"
+        git log -1 --oneline
+
+        echo
+        echo "OPENWRT REMOTE:"
+        git remote -v
+
+
+    # ============================================================
+    # VERIFICAR ATH.MK
+    # ============================================================
+    - name: Inspect ath.mk
+      run: |
+        echo "========================================"
+        echo "        ATH.MK BEFORE PATCH"
+        echo "========================================"
+
+        cd openwrt
+
+        echo
+        echo "ATH.MK:"
+        ls -lh package/kernel/mac80211/ath.mk
+
+        echo
+        echo "LINES 1-430:"
+        sed -n '1,430p' package/kernel/mac80211/ath.mk
+
+
+    # ============================================================
+    # MODIFICAR ATH.MK
+    #
+    # NÃO USAMOS MAIS git apply.
+    # A alteração é feita diretamente no arquivo atual.
+    # ============================================================
+    - name: Enable WCN36XX and ath10k SDIO
+      run: |
+        echo "========================================"
+        echo "     MODIFYING MAC80211 / ATH.MK"
+        echo "========================================"
+
+        python3 <<'PY'
+        from pathlib import Path
+
+        path = Path("openwrt/package/kernel/mac80211/ath.mk")
+
+        text = path.read_text()
+
+        original = text
+
+        # --------------------------------------------------------
+        # 1. Adicionar ath10k-sdio e wcn36xx à lista PKG_DRIVERS
+        # --------------------------------------------------------
+
+        old = (
+            "ath ath5k ath6kl ath6kl-sdio ath6kl-usb "
+            "ath9k ath9k-common ath9k-htc ath10k ath10k-smallbuffers"
+        )
+
+        new = (
+            "ath ath5k ath6kl ath6kl-sdio ath6kl-usb "
+            "ath9k ath9k-common ath9k-htc ath10k ath10k-sdio "
+            "ath10k-smallbuffers"
+        )
+
+        if old not in text:
+            raise SystemExit(
+                "ERRO: não encontrei a lista PKG_DRIVERS esperada."
+            )
+
+        text = text.replace(old, new, 1)
+
+
+        # --------------------------------------------------------
+        # 2. Adicionar WCN36XX à lista de DEBUGFS
+        # --------------------------------------------------------
+
+        old = "\tWIL6210_DEBUGFS \nendif"
+        new = "\tWIL6210_DEBUGFS \\\n\tWCN36XX_DEBUGFS \nendif"
+
+        if old in text:
+            text = text.replace(old, new, 1)
+        else:
+            # Algumas versões podem não possuir exatamente esse
+            # espaçamento. Tentativa alternativa.
+            old = "\tWIL6210_DEBUGFS\nendif"
+            new = "\tWIL6210_DEBUGFS \\\n\tWCN36XX_DEBUGFS\nendif"
+
+            if old in text:
+                text = text.replace(old, new, 1)
+            else:
+                print("WARNING: WCN36XX_DEBUGFS não foi adicionado.")
+                print("Isso não será tratado como erro fatal.")
+
+
+        # --------------------------------------------------------
+        # 3. Fazer o target MSM89xx compilar WCN36XX
+        # --------------------------------------------------------
+
+        old = (
+            "config-$(CONFIG_TARGET_ipq40xx) += ATH10K_AHB\n"
+            "config-$(CONFIG_PCI) += ATH9K_PCI"
+        )
+
+        new = (
+            "config-$(CONFIG_TARGET_ipq40xx) += ATH10K_AHB\n"
+            "config-$(CONFIG_TARGET_msm89xx) += WCN36XX\n"
+            "config-$(CONFIG_PCI) += ATH9K_PCI"
+        )
+
+        if old not in text:
+            raise SystemExit(
+                "ERRO: não encontrei o ponto para adicionar "
+                "CONFIG_TARGET_msm89xx."
+            )
+
+        text = text.replace(old, new, 1)
+
+
+        # --------------------------------------------------------
+        # 4. Permitir o pacote ath no MSM89xx
+        # --------------------------------------------------------
+
+        old = (
+            "DEPENDS+= @PCI_SUPPORT||USB_SUPPORT||TARGET_ath79 "
+            "+kmod-mac80211"
+        )
+
+        new = (
+            "DEPENDS+= @PCI_SUPPORT||USB_SUPPORT||TARGET_ath79||"
+            "TARGET_msm89xx +kmod-mac80211"
+        )
+
+        if old not in text:
+            raise SystemExit(
+                "ERRO: não encontrei DEPENDS do pacote ath."
+            )
+
+        text = text.replace(old, new, 1)
+
+
+        # --------------------------------------------------------
+        # 5. Criar variante ath10k-sdio
+        # --------------------------------------------------------
+
+        marker = "define KernelPackage/ath10k-smallbuffers"
+
+        if "define KernelPackage/ath10k-sdio" not in text:
+
+            if marker not in text:
+                raise SystemExit(
+                    "ERRO: não encontrei KernelPackage/ath10k-smallbuffers."
+                )
+
+            sdio = r'''
+        define KernelPackage/ath10k-sdio
+          $(call KernelPackage/mac80211/Default)
+          TITLE:=Atheros 802.11ac SDIO wireless cards support
+          URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath10k
+          DEPENDS+= +kmod-ath +kmod-mmc +@DRIVER_11AC_SUPPORT \
+            +ATH10K_THERMAL:kmod-hwmon-core +ATH10K_THERMAL:kmod-thermal
+          FILES:= \
+            $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath10k/ath10k_core.ko \
+            $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath10k/ath10k_sdio.ko
+          AUTOLOAD:=$(call AutoProbe,ath10k_core ath10k_sdio)
+          MODPARAMS.ath10k_core:=frame_mode=2
+          VARIANT:=sdio
+        endef
+
+        define KernelPackage/ath10k-sdio/description
+        This module adds support for wireless adapters based on
+        Atheros IEEE 802.11ac family of chipsets with SDIO bus.
+        endef
+
+        '''
+
+            text = text.replace(marker, sdio + marker, 1)
+
+
+        # --------------------------------------------------------
+        # 6. Criar pacote WCN36XX
+        # --------------------------------------------------------
+
+        if "define KernelPackage/wcn36xx" not in text:
+
+            marker = "define KernelPackage/ath12k"
+
+            if marker not in text:
+                raise SystemExit(
+                    "ERRO: não encontrei KernelPackage/ath12k."
+                )
+
+            wcn = r'''
+        define KernelPackage/wcn36xx
+          $(call KernelPackage/mac80211/Default)
+          TITLE:=Qualcomm Atheros WCN3660/3680 support
+          URL:=https://wireless.wiki.kernel.org/en/users/drivers/wcn36xx
+          DEPENDS+= @TARGET_msm89xx +kmod-ath +kmod-qcom-rproc-wcnss
+          FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/wcn36xx/wcn36xx.ko
+          AUTOLOAD:=$(call AutoProbe,wcn36xx)
+        endef
+
+        define KernelPackage/wcn36xx/description
+        This module adds support for Qualcomm Atheros WCN3660/3680 Wireless
+        blocks in some Qualcomm SoCs.
+        endef
+
+        '''
+
+            text = text.replace(marker, wcn + marker, 1)
+
+
+        # --------------------------------------------------------
+        # 7. Registrar ath10k-sdio na configuração do kernel
+        # --------------------------------------------------------
+
+        old = (
+            "config-$(call config_package,ath10k,regular) "
+            "+= ATH10K ATH10K_PCI"
+        )
+
+        new = (
+            "config-$(call config_package,ath10k,regular) "
+            "+= ATH10K ATH10K_PCI\n"
+            "config-$(call config_package,ath10k-sdio,sdio) "
+            "+= ATH10K ATH10K_SDIO"
+        )
+
+        if old not in text:
+            raise SystemExit(
+                "ERRO: não encontrei configuração do ath10k."
+            )
+
+        text = text.replace(old, new, 1)
+
+
+        # --------------------------------------------------------
+        # 8. Adicionar WCN36XX ao PKG_DRIVERS
+        # --------------------------------------------------------
+
+        # A primeira alteração já adicionou ath10k-sdio.
+        # Agora acrescentamos wcn36xx.
+
+        old = (
+            "owl-loader ar5523 wil6210 qcom-qmi-helpers"
+        )
+
+        new = (
+            "owl-loader ar5523 wil6210 wcn36xx qcom-qmi-helpers"
+        )
+
+        if old not in text:
+            raise SystemExit(
+                "ERRO: não encontrei final da lista PKG_DRIVERS."
+            )
+
+        text = text.replace(old, new, 1)
+
+
+        # --------------------------------------------------------
+        # 9. Mostrar alterações
+        # --------------------------------------------------------
+
+        if text == original:
+            raise SystemExit(
+                "ERRO: nenhuma alteração foi realizada."
+            )
+
+        path.write_text(text)
+
+        print("OK: ath.mk modificado com sucesso.")
+
+        PY
+
+
+    # ============================================================
+    # VERIFICAR RESULTADO
+    # ============================================================
+    - name: Verify WCN36XX changes
+      run: |
+        echo "========================================"
+        echo "        VERIFYING ATH.MK"
+        echo "========================================"
+
+        cd openwrt
+
+        echo
+        echo "WCN36XX:"
+        grep -n "WCN36XX" package/kernel/mac80211/ath.mk || true
+
+        echo
+        echo "ATH10K SDIO:"
+        grep -n "ath10k-sdio" package/kernel/mac80211/ath.mk || true
+
+        echo
+        echo "MSM89XX:"
+        grep -n "TARGET_msm89xx" package/kernel/mac80211/ath.mk || true
+
+        echo
+        echo "ATH10K_SDIO:"
+        grep -n "ATH10K_SDIO" package/kernel/mac80211/ath.mk || true
+
+        echo
+        echo "ATH.MK LINES 1-430:"
+        sed -n '1,430p' package/kernel/mac80211/ath.mk
+
+
+    # ============================================================
+    # CARREGAR TARGET MSM89XX
+    # ============================================================
+    - name: Load msm89xx target and packages
+      run: |
+        echo "========================================"
+        echo "        LOADING MSM89XX TARGET"
+        echo "========================================"
+
+        mv msm89xx openwrt/target/linux/msm89xx
+
+        echo
+        echo "Target installed."
+
+        echo
+        echo "Loading packages..."
+
+        mv packages openwrt/package/uz801
+
+        echo
+        echo "Packages installed."
+
+
+    # ============================================================
+    # VERIFICAR TARGET
+    # ============================================================
+    - name: Inspect MSM89xx target
+      run: |
+        echo "========================================"
+        echo "        MSM89XX TARGET"
+        echo "========================================"
+
+        find openwrt/target/linux/msm89xx -maxdepth 3 -type f | sort
+
+
+    # ============================================================
+    # DEPENDÊNCIAS
+    # ============================================================
     - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
+        echo "========================================"
+        echo "        INITIALIZING BUILD ENVIRONMENT"
+        echo "========================================"
+
         sudo rm -rf /etc/apt/sources.list.d/* \
           /usr/share/dotnet \
           /usr/local/lib/android \
@@ -40,103 +410,16 @@ jobs:
 
         sudo timedatectl set-timezone "$TZ"
 
-    - name: "Clone OpenWrt source code"
-      run: |
-        df -hT "$PWD"
 
-        git clone \
-          --depth=1 \
-          --branch "main" \
-          https://git.openwrt.org/openwrt/openwrt.git \
-          openwrt
-
-    - name: "Diagnose OpenWrt source"
-      run: |
-        echo "========================================"
-        echo "        OPENWRT COMMIT"
-        echo "========================================"
-
-        cd openwrt
-
-        git log -1 --oneline
-
-        echo
-        echo "========================================"
-        echo "        OPENWRT REMOTE"
-        echo "========================================"
-
-        git remote -v
-
-        echo
-        echo "========================================"
-        echo "        OPENWRT STATUS"
-        echo "========================================"
-
-        git status --short
-
-        echo
-        echo "========================================"
-        echo "        ATH.MK LOCATION"
-        echo "========================================"
-
-        ls -lh package/kernel/mac80211/ath.mk
-
-        echo
-        echo "========================================"
-        echo "        ATH.MK - LINES 250-340"
-        echo "========================================"
-
-        nl -ba package/kernel/mac80211/ath.mk | sed -n '250,340p'
-
-        echo
-        echo "========================================"
-        echo "        ATH10K / WCN36XX / SDIO REFERENCES"
-        echo "========================================"
-
-        grep -n -E \
-          'ath10k|ath11k|ath12k|wcn36xx|sdio|ATH10K|WCN36XX' \
-          package/kernel/mac80211/ath.mk || true
-
-        echo
-        echo "========================================"
-        echo "        ATH.MK - FIRST 430 LINES"
-        echo "========================================"
-
-        nl -ba package/kernel/mac80211/ath.mk | sed -n '1,430p'
-
-        cd ..
-
-        echo
-        echo "========================================"
-        echo "        PATCH CONTENT"
-        echo "========================================"
-
-        nl -ba enable_wcn36xx_mac80211.patch | sed -n '1,260p'
-
-    - name: Load msm89xx target and packages
-      run: |
-        echo "========================================"
-        echo "        APPLYING WCN36XX PATCH"
-        echo "========================================"
-
-        echo
-        echo "Checking patch..."
-        git apply --check --unsafe-paths enable_wcn36xx_mac80211.patch
-
-        echo
-        echo "Applying patch..."
-        git apply --unsafe-paths enable_wcn36xx_mac80211.patch
-
-        echo
-        echo "Moving MSM89xx target..."
-        mv msm89xx openwrt/target/linux/msm89xx
-
-        echo
-        echo "Moving packages..."
-        mv packages openwrt/package/uz801
-
+    # ============================================================
+    # FEEDS
+    # ============================================================
     - name: Update and install feeds
       run: |
+        echo "========================================"
+        echo "        UPDATING FEEDS"
+        echo "========================================"
+
         cd openwrt
 
         rm -rf tmp
@@ -145,18 +428,61 @@ jobs:
 
         ./scripts/feeds install -a
 
-    - name: "Load diffconfig"
+
+    # ============================================================
+    # DIFFCONFIG
+    # ============================================================
+    - name: Load diffconfig
       run: |
+        echo "========================================"
+        echo "        LOADING DIFFCONFIG"
+        echo "========================================"
+
         if [ -f diffconfig_mf68e ]; then
           mv diffconfig_mf68e openwrt/.config
+          echo "diffconfig_mf68e loaded."
+        else
+          echo "WARNING: diffconfig_mf68e not found."
         fi
 
-    - name: Download package
-      id: package
+
+    # ============================================================
+    # DEFCONFIG
+    # ============================================================
+    - name: Prepare configuration
       run: |
+        echo "========================================"
+        echo "        PREPARING CONFIGURATION"
+        echo "========================================"
+
         cd openwrt
 
         make defconfig
+
+        echo
+        echo "TARGET:"
+        grep '^CONFIG_TARGET' .config | head -30 || true
+
+        echo
+        echo "WCN36XX:"
+        grep 'WCN36XX' .config || true
+
+        echo
+        echo "ATH10K:"
+        grep 'ATH10K' .config || true
+
+
+    # ============================================================
+    # DOWNLOAD
+    # ============================================================
+    - name: Download package
+      id: package
+      run: |
+        echo "========================================"
+        echo "        DOWNLOADING PACKAGES"
+        echo "========================================"
+
+        cd openwrt
 
         make download -j8
 
@@ -164,12 +490,21 @@ jobs:
 
         find dl -size -1024c -exec rm -f {} \; || true
 
+
+    # ============================================================
+    # COMPILE
+    # ============================================================
     - name: Compile the firmware
       id: compile
       run: |
+        echo "========================================"
+        echo "        COMPILING MF68E"
+        echo "========================================"
+
         cd openwrt
 
-        echo -e "$(nproc) thread compile"
+        echo
+        echo "$(nproc) threads available"
 
         make -j$(nproc) || make -j1 || make -j1 V=s
 
@@ -185,10 +520,18 @@ jobs:
 
         echo "FILE_DATE=$(date +"%Y%m%d%H%M")" >> "$GITHUB_ENV"
 
+
+    # ============================================================
+    # ORGANIZAR FIRMWARE
+    # ============================================================
     - name: Organize files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
+        echo "========================================"
+        echo "        ORGANIZING FIRMWARE"
+        echo "========================================"
+
         cd openwrt/bin/targets/*/*
 
         rm -rf packages
@@ -197,6 +540,14 @@ jobs:
 
         echo "status=success" >> "$GITHUB_OUTPUT"
 
+        echo
+        echo "Generated files:"
+        ls -lah
+
+
+    # ============================================================
+    # UPLOAD
+    # ============================================================
     - name: Upload firmware
       uses: actions/upload-artifact@v4
       if: steps.organize.outputs.status == 'success' && !cancelled()
